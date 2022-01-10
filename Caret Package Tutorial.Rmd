@@ -1,0 +1,899 @@
+---
+title: "Caret Package Tutorial"
+author: "Sachin Sharma"
+date: "1/1/2022"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Data we are using here is Titanic Data set, you will get the data from here : https://www.kaggle.com/c/titanic/data
+
+# Importing Libraries 
+
+```{r}
+library(caret)
+library(e1071)
+library(doSNOW)
+library(ipred)
+library(xgboost)
+
+```
+# Importing the data 
+
+```{r}
+
+df_titanic <- read.csv("train_titanic.csv", stringsAsFactors = FALSE)
+
+str(df_titanic)
+
+```
+
+# Lets do some data wrangling 
+# Replace missing embarked values with mode 
+
+```{r}
+table(df_titanic$Embarked)
+
+```
+
+# There are two missing values in this column, since S is the most frequent value, we will fill the missing value with S 
+
+```{r}
+df_titanic$Embarked[df_titanic$Embarked==""]<- "S"
+
+table(df_titanic$Embarked)
+```
+# Now there is no missing values in the column 
+
+# Now lets the age column 
+
+```{r}
+summary(df_titanic$Age)
+
+```
+# There are 177 NA's here , lets tackle them 
+# Lets make a new column , which states whether age is given or not Missing Age 
+
+```{r}
+df_titanic$MissingAge <- ifelse(is.na(df_titanic$Age),"Y","N")
+
+# Now check the data 
+
+head(df_titanic)
+
+```
+
+# Now lets feature for family size 
+
+```{r}
+
+df_titanic$FamilySize <- 1+df_titanic$SibSp + df_titanic$Parch # we added 1 for self. so if SibSp is 1 and Parch is 0 => Family size = 1 + 1 = 2
+
+head(df_titanic)
+
+```
+# Lets create factors for the character vectors 
+
+```{r}
+
+df_titanic$Survived <- as.factor(df_titanic$Survived)
+df_titanic$Pclass <- as.factor(df_titanic$Pclass)
+df_titanic$Sex <- as.factor(df_titanic$Sex)
+df_titanic$Embarked <- as.factor(df_titanic$Embarked)
+df_titanic$MissingAge <- as.factor(df_titanic$MissingAge)
+
+str(df_titanic)
+```
+```{r}
+colnames(df_titanic)
+```
+
+# For features, lets remove data which are not required : 
+
+```{r}
+features_df_titanic <- c("Survived","Pclass","Sex","Age","SibSp","Parch","Fare","Embarked","FamilySize"  )
+
+train_features_titanic <-df_titanic[,features_df_titanic]
+
+head(train_features_titanic)
+```
+
+# First transform all feature to dummy variables 
+```{r}
+dummy.vars <- dummyVars(~., data = train_features_titanic[,-1] )
+
+train.dummy <- predict(dummy.vars, train_features_titanic[,-1])
+View(train.dummy)
+```
+
+# Now impute the missing values ! 
+
+
+```{r}
+
+pre.process <- preProcess(train.dummy, method = "bagImpute")
+imputed.data <- predict(pre.process, train.dummy)
+
+View(imputed.data)
+```
+
+
+
+```{r}
+train_features_titanic$Age <- imputed.data[, 6] # this will replace the age column in the training data with the imputed age data 
+View(train_features_titanic)
+
+
+```
+
+# Now splitting the data into traning and test set using caret 
+
+```{r}
+set.seed(54321)
+indexes <- createDataPartition(train_features_titanic$Survived,
+                               times = 1, 
+                               p = 0.7,
+                               list = FALSE)
+titanic.train <- train_features_titanic[indexes, ]
+titanic.test <- train_features_titanic[-indexes, ]
+
+```
+
+# Examine the proportions of the Survived class label across th datasets
+
+```{r}
+prop.table(table(train_features_titanic$Survived))
+
+```
+
+# Now prepare our model , to perform 10 fold cross validation repeated 3 times 
+```{r}
+train.control <- trainControl(method = "repeatedcv",
+                              number = 10,
+                              repeats =3,
+                              search = "grid")
+```
+
+# Leverage a grid search of hyperparameters for xgboost
+```{r}
+tune.grid <- expand.grid(eta = c(0.05,0.075,0.1),
+                         nrounds = c(50,75,100),
+                         max_depth = 6:8,
+                         min_child_weight = c(2.0,2.25,2.5),
+                         colsample_bytree = c(0.3,0.4,0.5),
+                         gamma = 0,
+                         subsample = 1)
+View(tune.grid)
+```
+
+
+# Now tuning the number based on the number cores / threads available on your machine 
+```{r}
+#cl <- makeCluster(10, type = "SOCK")# FOR BIG MACHINES 
+#cl <- makeCluster(5,type = "SOCK") # It is using 100% CPU SO REDUCE THIS TO 3 
+cl <- makeCluster(3,type = "SOCK")
+
+# Register cluster so that caret will know to train in parallel 
+
+registerDoSNOW(cl)
+
+```
+# Now train the xgboost model using 10 fold CV repeated 3 times and a hyperparameter grid search to train the optimal model 
+
+```{r}
+
+caret.cv <- train(Survived~.,
+                  data = titanic.train,
+                  method = "xgbTree",
+                  tuneGrid = tune.grid,
+                  trControl = train.control)
+#stopCluster()
+```
+# Examin the caret processing result 
+
+```{r}
+
+caret.cv
+```
+
+# Now predicting the test set using xgboost model trained on all 625 rows 
+
+```{r}
+preds <- predict(caret.cv, titanic.test)
+
+# Preparing confusion matrix to estimate the effectiveness of the model 
+confusionMatrix(preds, titanic.test$Survived)
+
+```
+
+# Using bagging, random forest and xgboost
+
+# Bagging 
+```{r}
+
+cvcontrol_bag <- trainControl(method = "repeatedcv",
+                              number = 5,
+                              repeats = 2,
+                              allowParallel = TRUE)
+set.seed(1234)
+
+bag_titanic <- train(Survived~.,
+                     data = titanic.train,
+                     method = "treebag",
+                     trControl = cvcontrol_bag,
+                     importance = TRUE)
+plot(varImp(bag_titanic))
+
+p <- predict(bag_titanic, titanic.test, type = "raw")
+
+```
+
+
+```{r}
+confusionMatrix(p,titanic.test$Survived)
+```
+
+
+# Random Forest 
+
+```{r}
+
+set.seed(1234)
+
+
+bag_titanic <- train(Survived~.,
+                     data = titanic.train,
+                     method = "treebag",
+                     trControl = cvcontrol_bag,
+                     importance = TRUE)
+plot(varImp(bag_titanic))
+
+p <- predict(bag_titanic, titanic.test, type = "raw")
+
+forest_titanic <- train(Survived~.,
+                     data = titanic.train,
+                     method = "rf",
+                     trControl = cvcontrol_bag,
+                     importance = TRUE)
+plot(varImp(forest_titanic))
+p_forest <- predict(forest_titanic, titanic.test, type = "raw")
+
+```
+
+# Confusion matrix 
+```{r}
+confusionMatrix(p_forest,titanic.test$Survived)
+
+```
+
+
+# Boosting 
+
+```{r}
+
+
+boosting_titanic <- train(Survived~.,
+                  data = titanic.train,
+                  method = "xgbTree",
+                  trControl = cvcontrol_bag,
+                  tuneGrid = expand.grid(nrounds = 500,
+                                         max_depth = 3,
+                                         eta = 0.28,
+                                         gamma = 1.8,
+                                         colsample_bytree =1,
+                                         min_child_weight = 1,
+                                         subsample = 1))
+
+plot(varImp(boosting_titanic))
+
+#v <- varImp(boosting_titanic)
+#plot(v,5) # It will give us top 5 variables 
+
+
+```
+
+
+```{r}
+plot(v,8) # It will give us top 8 variables 
+```
+
+
+
+```{r}
+
+p_boost_titanic <- predict(boosting_titanic,titanic.test,type = "raw")
+confusionMatrix(p_boost_titanic,titanic.test$Survived)
+
+```
+
+
+#XGBOOST MODEL 2
+
+```{r}
+
+boosting_titanic_2 <- train(Survived~.,
+                  data = titanic.train,
+                  method = "xgbTree",
+                  trControl = cvcontrol_bag,
+                  tuneGrid = expand.grid(nrounds = 500,
+                                         max_depth = 3,
+                                         eta = 0.35,
+                                         gamma = 2,
+                                         colsample_bytree =1,
+                                         min_child_weight = 1,
+                                         subsample = 1))
+
+# plot(varImp(boosting_titanic))
+
+
+p_boost_titanic_2 <- predict(boosting_titanic_2,titanic.test,type = "raw")
+confusionMatrix(p_boost_titanic_2,titanic.test$Survived)
+
+```
+
+
+
+
+#XGBOOST MODEL 3
+
+```{r}
+
+boosting_titanic_3 <- train(Survived~.,
+                  data = titanic.train,
+                  method = "xgbTree",
+                  trControl = cvcontrol_bag,
+                  tuneGrid = expand.grid(nrounds = 500,
+                                         max_depth = 3,
+                                         eta = 0.45,
+                                         gamma = 2.9,
+                                         colsample_bytree =1,
+                                         min_child_weight = 1,
+                                         subsample = 1))
+
+# plot(varImp(boosting_titanic))
+
+
+p_boost_titanic_3 <- predict(boosting_titanic_3,titanic.test,type = "raw")
+confusionMatrix(p_boost_titanic_3,titanic.test$Survived)
+
+```
+
+
+
+
+
+#XGBOOST MODEL 4
+
+```{r}
+
+set.seed(1234)
+
+boosting_titanic_4 <- train(Survived~.,
+                  data = titanic.train,
+                  method = "xgbTree",
+                  trControl = cvcontrol_bag,
+                  tuneGrid = expand.grid(nrounds = 500,
+                                         max_depth = 3,
+                                         eta = 0.48,
+                                         gamma = 3.2,
+                                         colsample_bytree =1,
+                                         min_child_weight = 1,
+                                         subsample = 1))
+
+# plot(varImp(boosting_titanic))
+
+
+p_boost_titanic_4 <- predict(boosting_titanic_4,titanic.test,type = "raw")
+confusionMatrix(p_boost_titanic_4,titanic.test$Survived)
+
+```
+
+```{r}
+head(titanic.train)
+str(titanic.train)
+```
+
+
+# APPLYING MODEL ON TEST DATA SET : 
+
+# Fitting model 3 XGBOOST on test data set of titanic now as this is the best model : 
+
+
+# Importing the data 
+
+```{r}
+
+titanic_test_submission <- read.csv("test_titanic.csv", stringsAsFactors = FALSE)
+
+str(titanic_test_submission)
+
+final_submission_test <- subset(titanic_test_submission, select = -c(PassengerId,Name,Ticket,Cabin))
+
+
+head(final_submission_test)
+
+# Need to add family size : 
+str(final_submission_test)
+
+final_submission_test$Pclass <- as.factor(final_submission_test$Pclass)
+final_submission_test$Sex <- as.factor(final_submission_test$Sex)
+final_submission_test$Embarked <- as.factor(final_submission_test$Embarked)
+
+```
+
+# Lets do some data wrangling 
+# Replace missing embarked values with mode 
+
+```{r}
+summary(final_submission_test$Embarked)
+
+```
+
+# Now lets the age column 
+
+```{r}
+summary(final_submission_test$Age)
+
+```
+# There are 86 NA's here , lets tackle them 
+# Lets make a new column , which states whether age is given or not Missing Age 
+
+```{r}
+final_submission_test$MissingAge <- ifelse(is.na(final_submission_test$Age),"Y","N")
+
+# Now check the data 
+
+head(final_submission_test)
+#summary(final_submission_test$Age)
+
+```
+
+# Now lets feature for family size 
+
+```{r}
+
+final_submission_test$FamilySize <- 1+final_submission_test$SibSp + final_submission_test$Parch # we added 1 for self. so if SibSp is 1 and Parch is 0 => Family size = 1 + 1 = 2
+
+head(final_submission_test)
+
+```
+
+# First transform all feature to dummy variables 
+```{r}
+dummy.vars_test <- dummyVars(~., data = final_submission_test )
+
+test.dummy <- predict(dummy.vars, final_submission_test)
+View(test.dummy)
+```
+
+# Now impute the missing values ! 
+
+
+```{r}
+
+pre.process_test <- preProcess(test.dummy, method = "bagImpute")
+imputed.data_test <- predict(pre.process_test, test.dummy)
+
+View(imputed.data_test)
+```
+
+
+
+```{r}
+train_features_titanic_test$Age <- imputed.data_test[, 6] # this will replace the age column in the training data with the imputed age data 
+View(train_features_titanic_test)
+nrow(train_features_titanic_test)
+
+```
+
+
+# Now prepare our model , to perform 10 fold cross validation repeated 3 times 
+```{r}
+train.control_test <- trainControl(method = "repeatedcv",
+                              number = 10,
+                              repeats =3,
+                              search = "grid")
+```
+
+# Leverage a grid search of hyperparameters for xgboost
+```{r}
+tune.grid_test <- expand.grid(eta = c(0.05,0.075,0.1),
+                         nrounds = c(50,75,100),
+                         max_depth = 6:8,
+                         min_child_weight = c(2.0,2.25,2.5),
+                         colsample_bytree = c(0.3,0.4,0.5),
+                         gamma = 0,
+                         subsample = 1)
+#View(tune.grid)
+```
+
+
+# Now tuning the number based on the number cores / threads available on your machine 
+```{r}
+#cl <- makeCluster(10, type = "SOCK")# FOR BIG MACHINES 
+#cl <- makeCluster(5,type = "SOCK") # It is using 100% CPU SO REDUCE THIS TO 3 
+cl_test <- makeCluster(3,type = "SOCK")
+
+# Register cluster so that caret will know to train in parallel 
+
+registerDoSNOW(cl_test)
+
+```
+# Now train the xgboost model using 10 fold CV repeated 3 times and a hyperparameter grid search to train the optimal model 
+
+```{r}
+
+caret.cv_test <- train(Survived~.,
+                  data = train_features_titanic_test,
+                  method = "xgbTree",
+                  tuneGrid = tune.grid_test,
+                  trControl = train.control_test)
+stopCluster()
+```
+# Examin the caret processing result 
+
+```{r}
+
+caret.cv
+```
+
+# Now predicting the test set using xgboost model trained on all 625 rows 
+
+```{r}
+preds <- predict(caret.cv, train_features_titanic_test)
+
+# Preparing confusion matrix to estimate the effectiveness of the model 
+confusionMatrix(preds, titanic.test$Survived)
+
+```
+
+# Using bagging, random forest and xgboost
+
+# Bagging 
+```{r}
+
+cvcontrol_bag <- trainControl(method = "repeatedcv",
+                              number = 5,
+                              repeats = 2,
+                              allowParallel = TRUE)
+set.seed(1234)
+
+bag_titanic <- train(Survived~.,
+                     data = titanic.train,
+                     method = "treebag",
+                     trControl = cvcontrol_bag,
+                     importance = TRUE)
+plot(varImp(bag_titanic))
+
+p <- predict(bag_titanic, titanic.test, type = "raw")
+
+```
+
+
+```{r}
+confusionMatrix(p,titanic.test$Survived)
+```
+
+
+# Random Forest 
+
+```{r}
+
+set.seed(1234)
+
+
+bag_titanic <- train(Survived~.,
+                     data = titanic.train,
+                     method = "treebag",
+                     trControl = cvcontrol_bag,
+                     importance = TRUE)
+plot(varImp(bag_titanic))
+
+p <- predict(bag_titanic, titanic.test, type = "raw")
+
+forest_titanic <- train(Survived~.,
+                     data = titanic.train,
+                     method = "rf",
+                     trControl = cvcontrol_bag,
+                     importance = TRUE)
+plot(varImp(forest_titanic))
+p_forest <- predict(forest_titanic, titanic.test, type = "raw")
+
+```
+
+# Confusion matrix 
+```{r}
+confusionMatrix(p_forest,titanic.test$Survived)
+
+```
+
+
+# Boosting 
+
+```{r}
+
+
+boosting_titanic <- train(Survived~.,
+                  data = titanic.train,
+                  method = "xgbTree",
+                  trControl = cvcontrol_bag,
+                  tuneGrid = expand.grid(nrounds = 500,
+                                         max_depth = 3,
+                                         eta = 0.28,
+                                         gamma = 1.8,
+                                         colsample_bytree =1,
+                                         min_child_weight = 1,
+                                         subsample = 1))
+
+plot(varImp(boosting_titanic))
+
+#v <- varImp(boosting_titanic)
+#plot(v,5) # It will give us top 5 variables 
+
+
+```
+
+
+```{r}
+plot(v,8) # It will give us top 8 variables 
+```
+
+
+
+```{r}
+
+p_boost_titanic <- predict(boosting_titanic,titanic.test,type = "raw")
+confusionMatrix(p_boost_titanic,titanic.test$Survived)
+
+```
+
+
+#XGBOOST MODEL 2
+
+```{r}
+
+boosting_titanic_2 <- train(Survived~.,
+                  data = titanic.train,
+                  method = "xgbTree",
+                  trControl = cvcontrol_bag,
+                  tuneGrid = expand.grid(nrounds = 500,
+                                         max_depth = 3,
+                                         eta = 0.35,
+                                         gamma = 2,
+                                         colsample_bytree =1,
+                                         min_child_weight = 1,
+                                         subsample = 1))
+
+# plot(varImp(boosting_titanic))
+
+
+p_boost_titanic_2 <- predict(boosting_titanic_2,titanic.test,type = "raw")
+confusionMatrix(p_boost_titanic_2,titanic.test$Survived)
+
+```
+
+
+
+
+#XGBOOST MODEL 3
+
+```{r}
+
+boosting_titanic_3 <- train(Survived~.,
+                  data = titanic.train,
+                  method = "xgbTree",
+                  trControl = cvcontrol_bag,
+                  tuneGrid = expand.grid(nrounds = 500,
+                                         max_depth = 3,
+                                         eta = 0.45,
+                                         gamma = 2.9,
+                                         colsample_bytree =1,
+                                         min_child_weight = 1,
+                                         subsample = 1))
+
+# plot(varImp(boosting_titanic))
+
+
+p_boost_titanic_3 <- predict(boosting_titanic_3,train_features_titanic_test,type = "raw")
+
+
+
+
+```
+
+```{r}
+p_boost_titanic_3_count <-  data.frame(p_boost_titanic_3)
+
+nrow(p_boost_titanic_3_count)
+```
+
+
+
+```{r}
+nrow(titanic_test_submission)
+
+nrow(train_features_titanic_test)
+```
+
+
+
+```{r}
+final_submission_04012022 <- titanic_test_submission$PassengerId
+
+final_submission_04012022 <- data.frame(final_submission_04012022)
+
+final_submission_04012022$p_boost_titanic_3 <- p_boost_titanic_3
+
+data.frame(p_boost_titanic_3)
+
+nrow(final_submission_04012022)
+
+write.csv(final_submission_04012022,"final_submission_04012022.csv")
+
+write.csv(p_boost_titanic_3,"p_boost_titanic_3.csv")
+
+```
+
+
+# test data titanic 
+
+```{r}
+testdf_submission <- read.csv("test_titanic.csv")
+
+head(testdf_submission)
+
+colnames(testdf_submission)
+```
+
+```{r}
+colnames(titanic.train)
+
+```
+
+```{r}
+testdf_submission <- subset(testdf_submission, select = -c(Name,Ticket,Cabin))
+
+testdf_submission
+
+final_submission_05012022 <- testdf_submission$PassengerId
+
+final_submission_05012022 <- data.frame(final_submission_05012022)
+
+testdf_submission <- testdf_submission[,-1]
+
+colnames(testdf_submission)
+
+```
+```{r}
+vis_miss(testdf_submission)
+```
+```{r}
+summary(testdf_submission$Age)
+```
+
+
+
+# There are 86 NA's here , lets tackle them 
+# Lets make a new column , which states whether age is given or not Missing Age 
+
+```{r}
+
+testdf_submission$MissingAge <- ifelse(is.na(testdf_submission$Age),"Y","N")
+
+# Now check the data 
+
+head(testdf_submission)
+
+```
+
+# Now lets feature for family size 
+
+```{r}
+
+testdf_submission$FamilySize <- 1+testdf_submission$SibSp + testdf_submission$Parch # we added 1 for self. so if SibSp is 1 and Parch is 0 => Family size = 1 + 1 = 2
+
+head(testdf_submission)
+
+```
+
+```{r}
+str(testdf_submission)
+```
+
+
+# Creating factor vectors   Embarked , Missing Age, Sex 
+
+```{r}
+testdf_submission$Sex <- as.factor(testdf_submission$Sex)
+testdf_submission$Embarked <- as.factor(testdf_submission$Embarked)
+testdf_submission$MissingAge <- as.factor(testdf_submission$MissingAge)
+testdf_submission$Pclass <- as.factor(testdf_submission$Pclass)
+
+str(testdf_submission)
+```
+
+
+# First transform all feature to dummy variables 
+```{r}
+dummy.vars1 <- dummyVars(~., data = testdf_submission )
+
+train.dummy1 <- predict(dummy.vars, testdf_submission)
+View(train.dummy1)
+```
+
+# Now impute the missing values ! 
+
+
+```{r}
+
+pre.process1 <- preProcess(train.dummy1, method = "bagImpute")
+imputed.data1 <- predict(pre.process1, train.dummy1)
+
+View(imputed.data1)
+```
+
+
+
+```{r}
+testdf_submission$Age <- imputed.data1[, 6] # this will replace the age column in the training data with the imputed age data 
+View(testdf_submission)
+
+testdf_submission_final <- testdf_submission[,-8]
+
+view(testdf_submission_final)
+```
+
+
+
+
+# Random Forest : 
+
+```{r}
+
+test_forest <- predict(forest_titanic, testdf_submission_final, type = "raw")
+
+
+PassengerId <- read.csv("test_titanic.csv")
+
+PassengerId <- PassengerId[,1]
+
+PassengerId <- data.frame(PassengerId)
+
+nrow(testdf_submission_final)
+
+PassengerId$Survived <- test_forest
+nrow(PassengerId)
+
+view(PassengerId)
+
+final_submission_05012022 <- cbind(PassengerId,result_forest)
+
+```
+
+# XG BOOSTING 
+
+```{r}
+test_boost<- predict(boosting_titanic_3, testdf_submission_final, type = "raw")
+
+
+PassengerId <- read.csv("test_titanic.csv")
+
+PassengerId <- PassengerId[,1]
+
+view(PassengerId) <- data.frame(PassengerId)
+
+PassengerId$Survived <- test_boost
+
+nrow(PassengerId)
+
+
+nrow(testdf_submission_final)
+
+```
+
+
+
+
